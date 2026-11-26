@@ -1,0 +1,3 @@
+Rule ID,Name,Status,DQ Dimension,Description,Defined By,Applicable To,Parent Rule ID,Rule Type,Rule Params,Threshold
+TH_DQ_00036,Customer-Individual-Customer Identifier-Validity (TH format),Pending Approval,Validity,TH customer numbers are 'TH' followed by 10 digits,TH,GO_00001,GO_DQ_00036,regex,"{""pattern"":""^TH[0-9]{10}$""}",98
+TH_DQ_00001,Customer-Individual-Thai National ID-Validity,Pending Approval,Validity,Must be exactly 13 digits,TH,TH_00001,,regex,"{""pattern"":""^[0-9]{13}$""}",99

@@ -1,0 +1,253 @@
+# Data360 Governance Platform: Databricks Asset Bundle
+# =====================================================
+# Deploys the whole platform into one Databricks workspace (Azure, AWS or GCP; all compute is serverless):
+#
+#   Group governance registry (Delta in Unity Catalog)  <catalog>.<schema_prefix>_governance
+#   d360_setup        job   creates / upgrades the registry, seeds AIA Group content, grants, (optional) demo data
+#   d360_onboard_bu   job   registers a BU: intake tables (Group-hosted or Delta Sharing), stewards, grants
+#   dq_engine         job   monthly DQ assessment: approved rules -> SQL -> dq_results
+#   app                     governance Databricks App (AppKit: React + Node), reads/writes through the SQL warehouse
+#
+# Quick start (see DEPLOYMENT.md):
+#   python3 scripts/configure_app.py -t dev              # writes catalog / prefix / auth mode into app/ for this target
+#   databricks bundle deploy -t dev
+#   databricks bundle run d360_setup -t dev
+#   databricks bundle run app -t dev
+# New BU (see ONBOARDING.md):
+#   databricks bundle run d360_onboard_bu -t prod --params bu_code=TH,bu_name="AIA Thailand",stewards=th.steward@aia.com
+
+bundle:
+  name: data360-governance
+
+sync:
+  exclude:
+    - deck/**
+    - "**/node_modules/**"
+    - app/dist/**
+    - app/client/dist/**
+    - app/.databricks/**
+    - "**/.env"
+    - "**/__pycache__/**"
+
+variables:
+  catalog:
+    description: Unity Catalog catalog that holds the governance schemas (must already exist; plain identifier, no hyphens)
+  schema_prefix:
+    description: Prefix for every schema the platform creates (<prefix>_governance, <prefix>_intake_<bu>, demo <prefix>_bu_*)
+    default: d360
+  warehouse_id:
+    description: Serverless SQL warehouse used by the app (and by AI/BI dashboards)
+  app_name:
+    description: Databricks App name (<= 30 chars, lowercase letters, digits, hyphens)
+    default: data360-governance
+  auth_mode:
+    description: "demo = persona switcher (one shared login); users = roles from <prefix>_governance.user_roles by signed-in email"
+    default: users
+  load_demo_data:
+    description: "true = also load the simulated VN / PH / MY BUs, Group Investments mart and history (demo workspaces only)"
+    default: "false"
+  admins:
+    description: Comma-separated emails bootstrapped as Group Data Governance admins in the app (setup job)
+    default: ""
+  dq_schedule:
+    description: PAUSED or UNPAUSED for the monthly DQ schedule (02:00 HKT on the 1st)
+    default: PAUSED
+  runner:
+    description: Principal the jobs run as (service principal application ID in prod; empty = the deploying user)
+    default: ""
+
+resources:
+  jobs:
+    # ── One-time platform setup; re-run after every upgrade (idempotent, never drops registry data) ──
+    d360_setup:
+      name: "d360-setup"
+      description: "Data360 governance: create/upgrade the registry in ${var.catalog}.${var.schema_prefix}_governance, seed Group content, grants"
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: registry
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/setup/d360_admin.py
+            parameters: ["sql", "--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}",
+                         "--files", "${workspace.file_path}/sql/01_schema.sql,${workspace.file_path}/sql/02_seed_group.sql"]
+        - task_key: is_demo
+          depends_on: [{ task_key: registry }]
+          condition_task: { op: EQUAL_TO, left: "${var.load_demo_data}", right: "true" }
+        - task_key: demo_data
+          depends_on: [{ task_key: is_demo, outcome: "true" }]
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/setup/d360_admin.py
+            parameters: ["sql", "--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}",
+                         "--files", "${workspace.file_path}/sql/demo/10_demo_registry.sql,${workspace.file_path}/sql/demo/11_demo_marts.sql"]
+        - task_key: demo_first_run
+          depends_on: [{ task_key: demo_data }]
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/dq_engine/run_dq.py
+            parameters: ["--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}", "--period", "2026-10", "--triggered-by", "setup (demo)"]
+        - task_key: demo_history
+          depends_on: [{ task_key: demo_first_run }]
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/setup/d360_admin.py
+            parameters: ["sql", "--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}",
+                         "--files", "${workspace.file_path}/sql/demo/12_demo_history.sql"]
+        - task_key: finalize
+          depends_on: [{ task_key: registry }, { task_key: demo_history }]
+          run_if: NONE_FAILED
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/setup/d360_admin.py
+            parameters: ["finalize", "--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}",
+                         "--app-sp", "${resources.apps.app.service_principal_client_id}", "--runner", "${var.runner}", "--admins", "${var.admins}"]
+        - task_key: demo_snapshot
+          depends_on: [{ task_key: finalize }, { task_key: demo_history }]
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/setup/d360_admin.py
+            parameters: ["sql", "--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}",
+                         "--files", "${workspace.file_path}/sql/demo/13_demo_snapshot.sql"]
+      environments:
+        - environment_key: default
+          spec: { environment_version: "3" }
+
+    # ── Onboard (or update) one BU; run once per BU, re-run safely to change settings ──
+    d360_onboard_bu:
+      name: "d360-onboard-bu"
+      description: "Data360 governance: register a BU, create or validate its intake tables, add stewards, grant the app"
+      max_concurrent_runs: 1
+      parameters:
+        - { name: bu_code, default: "" }
+        - { name: bu_name, default: "" }
+        - { name: region, default: "" }
+        - { name: intake_mode, default: "GROUP_HOSTED" }   # or DELTA_SHARE
+        - { name: intake_schema, default: "" }            # DELTA_SHARE: <shared_catalog>.<schema>
+        - { name: data_catalog, default: "" }             # catalog holding the BU's DQ marts (e.g. the shared catalog)
+        - { name: stewards, default: "" }                 # comma-separated emails
+      tasks:
+        - task_key: onboard
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/setup/d360_admin.py
+            parameters: ["onboard", "--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}",
+                         "--bu-code", "{{job.parameters.bu_code}}", "--bu-name", "{{job.parameters.bu_name}}", "--region", "{{job.parameters.region}}",
+                         "--intake-mode", "{{job.parameters.intake_mode}}", "--intake-schema", "{{job.parameters.intake_schema}}",
+                         "--data-catalog", "{{job.parameters.data_catalog}}", "--stewards", "{{job.parameters.stewards}}",
+                         "--app-sp", "${resources.apps.app.service_principal_client_id}", "--runner", "${var.runner}"]
+      environments:
+        - environment_key: default
+          spec: { environment_version: "3" }
+
+    # ── Monthly DQ assessment (also triggered on demand from the app) ──
+    dq_engine:
+      name: "data360-dq-engine"
+      description: "Data360 governance: compiles approved rules from ${var.schema_prefix}_governance.dq_rules to SQL and writes dq_results"
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 0 2 1 * ?"   # 02:00 on the 1st of each month
+        timezone_id: "Asia/Hong_Kong"
+        pause_status: ${var.dq_schedule}
+      parameters:
+        - { name: period, default: "" }
+        - { name: triggered_by, default: "schedule" }
+        - { name: tenant, default: "ALL" }
+      tasks:
+        - task_key: run_dq
+          environment_key: default
+          spark_python_task:
+            python_file: ./src/dq_engine/run_dq.py
+            parameters: ["--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}", "--period", "{{job.parameters.period}}",
+                         "--triggered-by", "{{job.parameters.triggered_by}}", "--tenant", "{{job.parameters.tenant}}"]
+      environments:
+        - environment_key: default
+          spec: { environment_version: "3" }
+
+  apps:
+    app:
+      name: ${var.app_name}
+      description: "Data360 governance platform: data elements / CDEs, DQ rules, approvals, results and lineage on Unity Catalog"
+      source_code_path: ./app
+      lifecycle:
+        started: true
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+        - name: dq-job
+          job:
+            id: ${resources.jobs.dq_engine.id}
+            permission: CAN_MANAGE_RUN
+
+targets:
+  # ── Customer: Azure Databricks. Host comes from your CLI profile (databricks bundle deploy -t dev -p <profile>). ──
+  dev:
+    mode: development
+    default: true
+    variables:
+      catalog: d360_dev                    # change to your dev catalog
+      warehouse_id: "<dev-sql-warehouse-id>"
+      app_name: d360-governance            # dev mode adds a "dev-<user>-" style prefix to some resources; keep this short
+      auth_mode: demo                      # persona switcher so testers can act as any role
+      load_demo_data: "true"               # simulated BUs so the app is usable before real BUs are onboarded
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: "<prod-deployer-sp-application-id>"
+    variables:
+      catalog: d360                        # change to your prod catalog
+      warehouse_id: "<prod-sql-warehouse-id>"
+      auth_mode: users
+      load_demo_data: "false"
+      admins: ""                           # e.g. "jane.doe@aia.com,john.tan@aia.com"
+      dq_schedule: UNPAUSED
+      runner: "<prod-deployer-sp-application-id>"
+    permissions:
+      - group_name: d360-platform-admins   # Entra ID group synced via SCIM
+        level: CAN_MANAGE
+      - group_name: d360-group-dg
+        level: CAN_VIEW
+
+  # ── Databricks internal: the live demo (AWS FEVM). root_path pinned so the existing app and job are updated in place. ──
+  demo_fevm:
+    workspace:
+      host: https://fevm-nicholas-aws-ws.cloud.databricks.com
+      root_path: /Workspace/Users/nicholas.leong@databricks.com/.bundle/data360-governance/default
+    variables:
+      catalog: nicholas_aws_ws_catalog
+      warehouse_id: 2107e3e12ef8f9df
+      auth_mode: demo
+      load_demo_data: "true"
+    resources:
+      jobs:
+        d360_reset_demo:
+          name: "d360-reset-demo"
+          description: "Restore the clean demo state from <prefix>_snapshot (run before each demo)"
+          tasks:
+            - task_key: reset
+              environment_key: default
+              spark_python_task:
+                python_file: ./src/setup/d360_admin.py
+                parameters: ["sql", "--catalog", "${var.catalog}", "--prefix", "${var.schema_prefix}",
+                             "--files", "${workspace.file_path}/sql/demo/reset_demo.sql"]
+          environments:
+            - environment_key: default
+              spec: { environment_version: "3" }
+
+  # ── Databricks internal: fresh-install test of the production path (no demo data, real user roles) ──
+  pkgtest_fevm:
+    mode: development
+    workspace:
+      host: https://fevm-nicholas-aws-ws.cloud.databricks.com
+    variables:
+      catalog: nicholas_aws_ws_catalog
+      schema_prefix: d360pkg
+      warehouse_id: 2107e3e12ef8f9df
+      app_name: d360-pkgtest
+      auth_mode: users
+      load_demo_data: "false"
+      admins: nicholas.leong@databricks.com

@@ -1,0 +1,3 @@
+DE ID,Name,Description,Status,CDE Flag,Subject Area,Data Domain,Data Sub-domain (L2),Defined by,DE Type,Parent DE ID,physical_table,physical_column
+TH_00001,Thai National ID Number,The 13-digit Thai national identification number of the customer.,Pending Approval,TRUE,Customer and Operations,Customer,Individual,TH,Atomic,GO_00004,<catalog>.<schema>.dq_customer_mart,id_doc_no
+TH_00002,Customer Mobile Number,The primary mobile number of the customer in E.164 format.,Pending Approval,FALSE,Customer and Operations,Customer,Contact,TH,Atomic,,,

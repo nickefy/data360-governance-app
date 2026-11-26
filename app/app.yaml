@@ -1,0 +1,13 @@
+# Written by scripts/configure_app.py; edit databricks.yml target variables instead.
+command: ['npm', 'run', 'start']
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  - name: DATABRICKS_JOB_ID
+    valueFrom: dq-job
+  - name: D360_CATALOG
+    value: nicholas_aws_ws_catalog
+  - name: D360_SCHEMA_PREFIX
+    value: d360
+  - name: D360_AUTH_MODE
+    value: demo

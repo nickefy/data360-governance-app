@@ -1,10 +1,46 @@
 # Data360 Governance Platform: demo/MVP on Databricks Apps + Unity Catalog
 
-> **Resume here.** Built 24–25 Nov 2026 for the AIA Data360 (Precisely Govern + Analyze) replacement RFI, after the 19 Nov walkthrough with AIA Group Data Governance.
-> Design and scope: `PLAN.md`. Customer deck: `deck/out/AIA Data360 Governance Platform - Demo Walkthrough.pptx` (rebuild: `cd deck && uv run --no-project --with python-pptx --with pillow python build_deck.py "out/AIA Data360 Governance Platform - Demo Walkthrough.pptx"`; diagram: `python3 diagrams/build_demo_arch.py diagrams/data360-governance-architecture.drawio` then `drawio -x -f png -s 2 -o diagrams/data360-governance-architecture.png diagrams/data360-governance-architecture.drawio`; screenshots in `deck/shots`; slide 15 sizing numbers come from `deck/sizing_check.py`, which imports `../data360-sizing/scripts/model.py` and applies overrides without changing it). Related: `../data360-rfi` (requirements), `../data360-sizing` (cost model + architecture diagram).
+## Resume here (status as of 26 Nov 2026)
 
-**Live app:** https://data360-governance-7474644918602366.aws.databricksapps.com (workspace `fevm-nick`, `fevm-nicholas-aws-ws`)
-**DQ job:** `data360-dq-engine` (job id 666435869066953), serverless, monthly schedule PAUSED, run on demand from the app.
+**What this is:** an MVP replacing Precisely Data360 (Govern + Analyze) for AIA Group Data Governance, built 24–26 Nov 2026 after the 19 Nov walkthrough. It's packaged as one Databricks Asset Bundle that installs into any workspace: [DEPLOYMENT.md](DEPLOYMENT.md), [ONBOARDING.md](ONBOARDING.md), [ARCHITECTURE.md](ARCHITECTURE.md). Presenter script: [DEMO_RUNBOOK.md](DEMO_RUNBOOK.md). Design: [PLAN.md](PLAN.md).
+**Repo:** https://github.com/nickefy/data360-governance-app (public; pushes as `nickefy`, see *Git* below). Related: `../data360-sizing` (1-year cost model; private repo), `../data360-rfi` (requirements).
+
+### Deployed environments
+| Env | Workspace (CLI profile) | Target / overrides | App | State |
+|---|---|---|---|---|
+| **Live demo** | fevm-nick (AWS) | `demo_fevm` | https://data360-governance-7474644918602366.aws.databricksapps.com | Use this for customer demos. Reset: `databricks bundle run d360_reset_demo -t demo_fevm -p fevm-nick` |
+| Production-style test (users auth, no demo data) | fevm-nick | `pkgtest_fevm` (prefix `d360pkg`) | `d360-pkgtest` | Test only; destroy when done |
+| New-environment test | fevm-nick | `dev` + `--var catalog=nicholas_aws_ws_catalog --var schema_prefix=d360new --var warehouse_id=2107e3e12ef8f9df` | `d360-governance` | Test only; destroy when done |
+| **Azure test** | aia-aigw (Azure, shared FE workspace) | `dev` + `--var catalog=workshop --var warehouse_id=148ccb90800933a1 --var admins=nicholas.leong@databricks.com` | https://d360-governance-984752964297111.11.azure.databricksapps.com | Installed by following DEPLOYMENT.md only; works. Destroy when done |
+
+Before any `bundle deploy`, run `python3 scripts/configure_app.py -t <target> -p <profile> [same --var ...]`. It rewrites the catalog and prefix in `app/config/queries` and `app/app.yaml`. The committed state is configured for `demo_fevm`; re-run it for `demo_fevm` when you finish working on another target.
+
+### Open items
+1. **Two test draft rules** (`test12345`, `test123456`, created 25 Nov) are in the live demo and in its reset snapshot, and show on *Approvals*. Delete them in the app (DQ Rules), then re-take the snapshot: `D360_PREFIX=d360 uv run --no-project --with databricks-sdk python scripts/run_sql.py fevm-nick 2107e3e12ef8f9df nicholas_aws_ws_catalog sql/demo/13_demo_snapshot.sql`.
+2. **Before handing to AIA:**
+   - The `prod` target's `permissions` block names Entra ID groups (`d360-platform-admins`, `d360-group-dg`). Make the doc say they must exist, or make them optional.
+   - Run the `prod` target on Azure (users auth, service principal run_as, new prefix).
+   - Have a colleague follow DEPLOYMENT.md cold.
+   - Real cross-workspace Delta Sharing has not been run.
+3. **Sizing:** deck slide 15 re-checks the 1-year cost against the demo (Base $60.6k without Lakebase vs $65.1k in the initial sizing). `../data360-sizing/scripts/model.py` is unchanged, pending AIA's answer on what "~20 hours a month" and "production spec for the dev environment" mean.
+4. **Not built** (see the deck's scope slide):
+   - multi-step approvals and SLAs
+   - DQ issue management
+   - non-Databricks metadata scanners
+   - AI rule drafting
+   - on-behalf-of-user reads with UC row filters
+5. Clean up the test environments above when no longer needed (commands under *Package layout*).
+
+### Git
+```
+git add -A && git -c user.name=nickefy -c user.email=52008075+nickefy@users.noreply.github.com commit -m "..."
+gh auth switch -u nickefy && git -c credential.helper='!gh auth git-credential' push && gh auth switch -u nicholas-leong_data
+```
+Pre-packaging backup: `~/Desktop/nick-databricks/repositories-backup-2026-11-20/data360-governance-app-pre-packaging-2026-11-26.tgz`.
+
+### Deck
+Customer deck: `deck/out/AIA Data360 Governance Platform - Demo Walkthrough.pptx` (rebuild: `cd deck && uv run --no-project --with python-pptx --with pillow python build_deck.py "out/AIA Data360 Governance Platform - Demo Walkthrough.pptx"`; diagram: `python3 diagrams/build_demo_arch.py diagrams/data360-governance-architecture.drawio` then `drawio -x -f png -s 2 -o diagrams/data360-governance-architecture.png diagrams/data360-governance-architecture.drawio`; screenshots in `deck/shots`; slide 15 sizing numbers come from `deck/sizing_check.py`, which imports `../data360-sizing/scripts/model.py` and applies overrides without changing it). Related: `../data360-rfi` (requirements), `../data360-sizing` (cost model + architecture diagram).
+Deck screenshots: run the app locally (`cd app && npm run dev`) and use `deck/tools/shoot.mjs` (usage in the file).
 
 ## What it shows
 | Page | Demo point |
